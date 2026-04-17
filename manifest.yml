@@ -1,0 +1,11 @@
+---
+name: OpenCode
+category: Interactive Apps
+subcategory: Services
+role: batch_connect
+description: |
+  Launch a browser-based [OpenCode] terminal session on an interactive
+  node. OpenCode is an open-source AI coding assistant with a terminal UI
+  that supports multiple LLM providers.
+
+  [OpenCode]: https://opencode.ai

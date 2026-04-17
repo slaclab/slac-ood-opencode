@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+
+# SIF image path (set in before.sh.erb, exported into this script)
+OPENCODE_SIF="${SINGULARITY_IMAGE_PATH}"
+
+# Ignore SIGHUP — the OOD linux_host adapter sends SIGHUP to the process group
+# after signalling readiness; without this ttyd exits immediately after after.sh.erb
+# reports the port open.
+trap '' SIGHUP
+
+# Change to working directory
+cd "${WORKING_DIR}"
+
+# Launch ttyd inside the opencode SIF directly via apptainer exec.
+# ttyd runs as a subprocess inside the SIF, so `opencode` is naturally on PATH —
+# no nested apptainer needed. ttyd execs `opencode` via PTY within the same container.
+#
+# --auth-header: OOD mod_ood_proxy injects X-Forwarded-User server-side on all
+#   /node/<host>/<port>/ requests — primary auth layer
+# --credential-file: second auth layer; password read from file at startup so it
+#   never appears in ps aux / /proc/cmdline. File is deleted 2s after launch.
+# --writable: enable PTY input (required for interactive opencode TUI)
+# Note: --check-origin omitted — OOD's reverse proxy sends a different Origin header
+#   than ttyd's listening address, causing WebSocket connections to be refused.
+<%
+  llm_provider = context.llm_provider.to_s.strip
+  if llm_provider == "sdf_sage"
+    # NODE_TLS_REJECT_UNAUTHORIZED=0 — llm.sdf.slac.stanford.edu uses a self-signed
+    # or internal CA cert that Node.js rejects by default. Set in the shell command
+    # so it is inherited by opencode but never leaks into the outer environment.
+    ttyd_cmd = 'export NODE_TLS_REJECT_UNAUTHORIZED=0 && /sdf/sw/s3df-cli/bin/s3df login --force && echo "Authentication complete. Starting OpenCode..." && exec opencode'
+  else
+    ttyd_cmd = 'exec opencode'
+  end
+%>
+apptainer exec -B /sdf,/fs,/lscratch "${OPENCODE_SIF}" \
+  ttyd \
+    --port ${port} \
+    --base-path "/node/${host}/${port}/" \
+    --auth-header X-Forwarded-User \
+    --credential-file "${TTYD_CRED_FILE}" \
+    --writable \
+    bash -c '<%= ttyd_cmd %>' &
+TTYD_PID=$!
+
+# ttyd reads --credential-file once at startup into memory; the file is dead weight
+# after that. Delete it to minimise the on-disk exposure window.
+sleep 2
+rm -f "${TTYD_CRED_FILE}"
+
+wait ${TTYD_PID}

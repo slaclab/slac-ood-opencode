@@ -1,0 +1,146 @@
+# Export module function if available
+[[ $(type -t module) == "function" ]] && export -f module
+
+# Generate a per-session ttyd credential file (owner-read only, password never in process list).
+# Written to ~/ondemand with a PID-unique name — OOD's own data dir, always exists.
+# TTYD_USER / TTYD_PASS are local (not exported) to avoid /proc/<pid>/environ leakage.
+# TTYD_CRED_FILE is exported so script.sh.erb can pass it to ttyd and delete it after startup.
+export TTYD_CRED_FILE="${HOME}/ondemand/.ttyd-$$.cred"
+TTYD_USER="${USER}"
+TTYD_PASS="$(openssl rand -base64 16 | tr -d '=+/')"
+(umask 077; printf '%s:%s' "${TTYD_USER}" "${TTYD_PASS}" > "${TTYD_CRED_FILE}")
+
+# Find available port
+port=$(find_port ${host})
+
+# Working directory (default to $HOME)
+# ERB strips shell metacharacters before interpolation to prevent command substitution.
+# context.working_dir is validated to contain only safe path characters.
+<%
+  wd = context.working_dir.to_s.strip
+  wd = "" unless wd.match?(%r{\A[A-Za-z0-9_./ -]*\z})
+%>
+export WORKING_DIR="<%= wd %>"
+if [ -z "${WORKING_DIR}" ] || [ ! -d "${WORKING_DIR}" ]; then
+  export WORKING_DIR="${HOME}"
+fi
+
+# SIF image path — selected by user from version dropdown
+export SINGULARITY_IMAGE_PATH="<%= context.sif_version %>"
+if [ ! -f "${SINGULARITY_IMAGE_PATH}" ]; then
+  echo "ERROR: SIF not found at ${SINGULARITY_IMAGE_PATH}" >&2
+  clean_up 1
+fi
+
+# Write ~/.config/opencode/opencode.json for the selected LLM provider.
+#
+# Strategy: always rewrite the provider block on every launch so that switching
+# providers between sessions Just Works. All other opencode config keys are
+# preserved via a merge — only the "provider" key is replaced.
+<%
+  llm_provider   = context.llm_provider.to_s.strip
+  api_key        = context.slac_bedrock_key.to_s.strip
+  sdf_provider   = context.sdf_sage_provider.to_s.strip
+  sdf_repo       = context.sdf_sage_repo.to_s.strip
+  # Normalise: bare facility name → facility:default
+  sdf_repo       = "#{sdf_repo}:default" unless sdf_repo.include?(":")
+  # Validate final facility:repo format
+  sdf_repo       = "" unless sdf_repo.match?(/\A[A-Za-z0-9_\-]+:[A-Za-z0-9_\-\/]+\z/)
+  sdf_provider   = "" unless sdf_provider.match?(/\A[A-Za-z0-9_\-]+\z/)
+
+  if llm_provider == "bedrock" && api_key.empty?
+    raise "Bedrock provider selected but API key is blank. Please enter your SLAC AI API key."
+  end
+%>
+
+OPENCODE_CONFIG_DIR="${HOME}/.config/opencode"
+OPENCODE_CONFIG="${OPENCODE_CONFIG_DIR}/opencode.json"
+
+mkdir -p "${OPENCODE_CONFIG_DIR}"
+chmod go-rwx "${OPENCODE_CONFIG_DIR}"
+
+# Seed a minimal config if none exists
+if [ ! -f "${OPENCODE_CONFIG}" ]; then
+  (umask 077; printf '{"$schema":"https://opencode.ai/config.json"}\n' > "${OPENCODE_CONFIG}")
+fi
+
+<% if llm_provider == "bedrock" %>
+# --- Bedrock provider (via SLAC AI API proxy, OpenAI-compatible) ---
+# The SLAC proxy exposes an OpenAI-compatible endpoint; the anthropic provider
+# in opencode does not work against it. Use @ai-sdk/openai-compatible instead,
+# with the SLAC key passed as the Bearer token via the apiKey field.
+python3 - "${OPENCODE_CONFIG}" << 'PYEOF'
+import json, sys
+path = sys.argv[1]
+with open(path) as f:
+    s = json.load(f)
+s["$schema"] = "https://opencode.ai/config.json"
+s["provider"] = {
+    "litellm": {
+        "name": "Claude (SLAC)",
+        "npm": "@ai-sdk/openai-compatible",
+        "options": {
+            "baseURL": "https://ai-api.slac.stanford.edu/v1",
+            "apiKey": "<%= api_key %>",
+        },
+        "models": {
+            "us.anthropic.claude-sonnet-4-6": {
+                "name": "Claude Sonnet 4.6"
+            },
+            "us.anthropic.claude-opus-4-6-v1": {
+                "name": "Claude Opus 4.6"
+            },
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0": {
+                "name": "Claude Haiku 4.5"
+            },
+        },
+    }
+}
+s["model"] = "litellm/us.anthropic.claude-sonnet-4-6"
+with open(path, "w") as f:
+    json.dump(s, f, indent=2)
+PYEOF
+echo "Updated ~/.config/opencode/opencode.json for provider: bedrock"
+
+<% else %>
+# --- SDF-Sage provider (OpenAI-compatible via llm.sdf.slac.stanford.edu) ---
+<% if sdf_repo.empty? || sdf_provider.empty? %>
+echo "ERROR: SDF-Sage selected but facility:repo or provider is blank or invalid." >&2
+clean_up 1
+<% end %>
+
+# Obtain a fresh S3DF token via device flow — blocks until browser auth completes
+# (moved to script.sh.erb so the user sees the auth URL in the terminal window)
+
+python3 - "${OPENCODE_CONFIG}" << 'PYEOF'
+import json, sys
+path = sys.argv[1]
+with open(path) as f:
+    s = json.load(f)
+s["$schema"] = "https://opencode.ai/config.json"
+s["provider"] = {
+    "sdf_sage": {
+        "name": "Claude (SDF-Sage)",
+        "npm": "@ai-sdk/openai-compatible",
+        "options": {
+            "baseURL": "https://llm.sdf.slac.stanford.edu/v1",
+            "apiKey": "{file:~/.s3df-access-token}",
+        },
+        "models": {
+            "<%= sdf_repo %>/<%= sdf_provider %>/claude-sonnet-4.6": {
+                "name": "Claude Sonnet 4.6"
+            },
+            "<%= sdf_repo %>/<%= sdf_provider %>/claude-haiku-4.5": {
+                "name": "Claude Haiku 4.5"
+            },
+        },
+    }
+}
+s["model"] = "sdf_sage/<%= sdf_repo %>/<%= sdf_provider %>/claude-sonnet-4.6"
+with open(path, "w") as f:
+    json.dump(s, f, indent=2)
+PYEOF
+echo "Updated ~/.config/opencode/opencode.json for provider: sdf_sage"
+<% end %>
+
+chmod go-rwx "${OPENCODE_CONFIG}"
